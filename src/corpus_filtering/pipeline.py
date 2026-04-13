@@ -206,11 +206,42 @@ class FilterPipeline:
         }
 
 
+def run_filters(filters, input_path, mode="both", output_dir="output/", **kwargs):
+    """
+    Run multiple filters sequentially on the same input corpus.
+    
+    Args:
+        filters: list of CorpusFilter instances
+        input_path: path to UD directory or single CoNLL-U file
+        mode: 'labeled', 'clean_train', or 'both'
+        output_dir: shared output directory (each filter gets its own subdir)
+        **kwargs: passed to FilterPipeline (train_ratio, dev_ratio, seed, shuffle)
+    """
+    for i, f in enumerate(filters, 1):
+        print(f"\n{'='*60}")
+        print(f"[{i}/{len(filters)}] Running filter: {f.name}")
+        print(f"{'='*60}\n")
+        try:
+            p = FilterPipeline(f, mode=mode, output_dir=output_dir, **kwargs)
+            p.run(input_path)
+            print(f"✓ Completed {f.name}")
+        except Exception as e:
+            print(f"✗ FAILED {f.name}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+
 if __name__ == "__main__":
-    f = BindingReflexive()
-    print(f.name)
-    p = FilterPipeline(f, mode="both")
-    # Works with either:
-    p.run("/Users/argy/PHD/WS/corpus_filtering/data/output_100M.conllu")
-    # ...or a UD directory:
-    # p.run("/Users/argy/PHD/WS/corpus_filtering/data/ud_dir")
+    INPUT_PATH = "/output_100M.conllu"
+    OUTPUT_DIR = "output/"
+
+    filters = [
+        NotFilter(),
+        ExistentialThereQuantifierFilter(),
+        BindingReflexive(),
+        InterrogativeWhModifierFilter(),
+        # add more as you build them
+    ]
+
+    run_filters(filters, INPUT_PATH, mode="both", output_dir=OUTPUT_DIR)
