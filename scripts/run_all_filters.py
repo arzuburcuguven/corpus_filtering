@@ -1,5 +1,4 @@
 from src.corpus_filtering.filters.base import (
-    NotFilter,
     ExistentialThereQuantifierFilter,
     BindingReflexive,
     InterrogativeWhModifierFilter,
