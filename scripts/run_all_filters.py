@@ -10,9 +10,8 @@ OUTPUT_DIR = "output/"
 
 if __name__ == "__main__":
     filters = [
-        NotFilter(),
         ExistentialThereQuantifierFilter(),
         BindingReflexive(),
         InterrogativeWhModifierFilter(),
     ]
-    run_filters(filters, INPUT_PATH, mode="both", output_dir=OUTPUT_DIR)
+    run_filters(filters, INPUT_PATH, output_dir=OUTPUT_DIR)
