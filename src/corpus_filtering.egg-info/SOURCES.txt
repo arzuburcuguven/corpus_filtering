@@ -1,0 +1,7 @@
+pyproject.toml
+src/corpus_filtering/pipeline.py
+src/corpus_filtering.egg-info/PKG-INFO
+src/corpus_filtering.egg-info/SOURCES.txt
+src/corpus_filtering.egg-info/dependency_links.txt
+src/corpus_filtering.egg-info/top_level.txt
+src/corpus_filtering/filters/base.py
