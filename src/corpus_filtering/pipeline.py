@@ -1,5 +1,5 @@
 from corpus_filtering.filters.base import CorpusFilter
-from corpus_filtering.filters.base import ExistentialThereQuantifierFilter, BindingReflexive, InterrogativeWhModifierFilter
+from corpus_filtering.filters.base import ExistentialThereQuantifierFilter, BindingReflexive, InterrogativeWhModifierFilter, LicensedNPI
 from conllu import parse_incr
 from pathlib import Path
 import json
@@ -171,13 +171,11 @@ def run_filters(filters, input_path, output_dir="output/", **kwargs):
 
 
 if __name__ == "__main__":
-    INPUT_PATH = "/Users/argy/PHD/WS/corpus_filtering/data/output_100M.conllu"
+    INPUT_PATH = "/Users/argy/PHD/WS/corpus_filtering/UD_English-GUM"
     OUTPUT_DIR = "output/"
 
     filters = [
-        ExistentialThereQuantifierFilter(),
-        BindingReflexive(),
-        InterrogativeWhModifierFilter(),
+        LicensedNPI(),
     ]
 
     run_filters(filters, INPUT_PATH, output_dir=OUTPUT_DIR)
