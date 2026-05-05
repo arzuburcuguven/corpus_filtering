@@ -173,6 +173,9 @@ class ExistentialThereQuantifierFilter(CorpusFilter):
 
 class BindingReflexive(CorpusFilter):
 
+    #source wikipeadi
+    reflexives = {"myself", "thyself", "thyselves", "himself", "herself", "itself", "ourselves", "yourself", "yourselves", "themself", "themselves", "oneself"}
+
     @property
     def name(self) -> str:
         return "Binding-reflexive"
@@ -182,6 +185,8 @@ class BindingReflexive(CorpusFilter):
         for tok in id_map.values():
             feats = tok.get("feats") or {}
             if feats.get("Reflex") == "Yes":
+                return True
+            if tok.get("lemma") in self.reflexives:
                 return True
         return False
 
@@ -273,3 +278,4 @@ class LicensedNPI(CorpusFilter):
                 return True
 
         return False
+    

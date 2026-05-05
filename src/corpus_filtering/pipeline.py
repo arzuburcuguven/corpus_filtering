@@ -171,11 +171,11 @@ def run_filters(filters, input_path, output_dir="output/", **kwargs):
 
 
 if __name__ == "__main__":
-    INPUT_PATH = "/Users/argy/PHD/WS/corpus_filtering/UD_English-GUM"
+    INPUT_PATH = "/Users/argy/PHD/WS/corpus_filtering/data/test.conllu"
     OUTPUT_DIR = "output/"
 
     filters = [
-        LicensedNPI(),
+        BindingReflexive(),
     ]
 
     run_filters(filters, INPUT_PATH, output_dir=OUTPUT_DIR)
