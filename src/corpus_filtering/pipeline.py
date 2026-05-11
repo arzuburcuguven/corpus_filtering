@@ -67,33 +67,17 @@ class FilterPipeline:
         self._process_stream(stream())
 
     def _run_from_single_file(self, input_path: Path):
-        # Pass 1: count sentences
-        print("Counting sentences...")
-        n_sents = sum(1 for _ in self._read_conllu(input_path))
-        print(f"Total sentences: {n_sents:,}")
-
-        indices = list(range(n_sents))
-        if self.shuffle:
-            rng = random.Random(self.seed)
-            rng.shuffle(indices)
-
-        n_train = int(n_sents * self.train_ratio)
-        n_dev = int(n_sents * self.dev_ratio)
-
-        train_idx = set(indices[:n_train])
-        dev_idx = set(indices[n_train:n_train + n_dev])
-
-        print(f"Splitting: {n_train:,} train / {n_dev:,} dev / {n_sents - n_train - n_dev:,} test")
+        rng = random.Random(self.seed)
 
         def stream():
-            for i, sent in enumerate(self._read_conllu(input_path)):
-                if i in train_idx:
+            for sent in self._read_conllu(input_path):
+                r = rng.random()
+                if r < self.train_ratio:
                     yield "train", sent
-                elif i in dev_idx:
-                    yield "dev", sent
+                elif r < self.train_ratio + self.dev_ratio_
+                    yield "dev",sent
                 else:
-                    yield "test", sent
-
+                    yield "test",sent
         self._process_stream(stream())
 
     def _process_stream(self, sentence_stream):
