@@ -4,6 +4,7 @@ from conllu import parse_incr
 from pathlib import Path
 import json
 import random
+import pickle
 
 
 class FilterPipeline:
@@ -41,7 +42,10 @@ class FilterPipeline:
 
     def run(self, input_path: str):
         path = Path(input_path)
-        if path.is_dir():
+        if path.suffix == ".pkl" or path.suffix == ".pickle":
+            print(f"Input is a picle")
+            self.run_from_ud(path)
+        elif path.is_dir():
             print(f"Input is a directory — treating as UD corpus")
             self._run_from_ud(path)
         elif path.is_file():
@@ -49,6 +53,24 @@ class FilterPipeline:
             self._run_from_single_file(path)
         else:
             raise FileNotFoundError(f"{input_path} is neither a file nor a directory")
+    
+    def _run_from_pickle(self, input_path: Path):
+        print("pickle..")
+        with open(input_path, "rb") as f:
+            sentences = pickle.load(f)
+        print(f"loaded {len(sentences):,} sents")
+        rng = random.Random(self.seed)
+
+        def stream():
+            for sent in self.sentences:
+                r = rng.random()
+                if r < self.train_ratio:
+                    yield "train", sent
+                elif r < self.train_ratio + self.dev_ratio:
+                    yield "dev",sent
+                else:
+                    yield "test",sent
+        self._process_stream(stream())
 
     def _run_from_ud(self, ud_path: Path):
         train_file = next(ud_path.glob("*-ud-train.conllu"))
@@ -74,7 +96,7 @@ class FilterPipeline:
                 r = rng.random()
                 if r < self.train_ratio:
                     yield "train", sent
-                elif r < self.train_ratio + self.dev_ratio_
+                elif r < self.train_ratio + self.dev_ratio:
                     yield "dev",sent
                 else:
                     yield "test",sent
@@ -153,13 +175,3 @@ def run_filters(filters, input_path, output_dir="output/", **kwargs):
             traceback.print_exc()
             continue
 
-
-if __name__ == "__main__":
-    INPUT_PATH = "/Users/argy/PHD/WS/corpus_filtering/data/test.conllu"
-    OUTPUT_DIR = "output/"
-
-    filters = [
-        BindingReflexive(),
-    ]
-
-    run_filters(filters, INPUT_PATH, output_dir=OUTPUT_DIR)
