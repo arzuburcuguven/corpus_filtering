@@ -5,6 +5,7 @@ from pathlib import Path
 import json
 import random
 import pickle
+import argparse
 
 
 class FilterPipeline:
@@ -42,9 +43,9 @@ class FilterPipeline:
 
     def run(self, input_path: str):
         path = Path(input_path)
-        if path.suffix == ".pkl" or path.suffix == ".pickle":
-            print(f"Input is a picle")
-            self.run_from_ud(path)
+        if path.suffix in (".pkl", ".pickle"):
+            print(f"Input is a pickle")
+            self._run_from_pickle(path)  # BUG FIX: was self.run_from_ud
         elif path.is_dir():
             print(f"Input is a directory — treating as UD corpus")
             self._run_from_ud(path)
@@ -53,7 +54,7 @@ class FilterPipeline:
             self._run_from_single_file(path)
         else:
             raise FileNotFoundError(f"{input_path} is neither a file nor a directory")
-    
+
     def _run_from_pickle(self, input_path: Path):
         print("pickle..")
         with open(input_path, "rb") as f:
@@ -62,14 +63,15 @@ class FilterPipeline:
         rng = random.Random(self.seed)
 
         def stream():
-            for sent in self.sentences:
+            for sent in sentences:  # BUG FIX: was self.sentences
                 r = rng.random()
                 if r < self.train_ratio:
                     yield "train", sent
                 elif r < self.train_ratio + self.dev_ratio:
-                    yield "dev",sent
+                    yield "dev", sent
                 else:
-                    yield "test",sent
+                    yield "test", sent
+
         self._process_stream(stream())
 
     def _run_from_ud(self, ud_path: Path):
@@ -77,7 +79,6 @@ class FilterPipeline:
         dev_file = next(ud_path.glob("*-ud-dev.conllu"))
         test_file = next(ud_path.glob("*-ud-test.conllu"))
 
-        # Build an iterator over (split_name, sentence) for the unified writer
         def stream():
             for sent in self._read_conllu(train_file):
                 yield "train", sent
@@ -97,29 +98,22 @@ class FilterPipeline:
                 if r < self.train_ratio:
                     yield "train", sent
                 elif r < self.train_ratio + self.dev_ratio:
-                    yield "dev",sent
+                    yield "dev", sent
                 else:
-                    yield "test",sent
+                    yield "test", sent
+
         self._process_stream(stream())
 
     def _process_stream(self, sentence_stream):
-        """Single unified output writer — same outputs every time."""
         out_dir = self.output_dir / self.filter.name
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Open all output files
         files = {
-            # Labelled CoNLL-U for all splits
-            "train_conllu": open(out_dir / "train.conllu", "w", encoding="utf-8"),
-            "dev_conllu":   open(out_dir / "dev.conllu",   "w", encoding="utf-8"),
-            "test_conllu":  open(out_dir / "test.conllu",  "w", encoding="utf-8"),
-            # Untouched (full) text for all splits
-            "train_full":   open(out_dir / "train_full.txt", "w", encoding="utf-8"),
-            "dev_full":     open(out_dir / "dev_full.txt",   "w", encoding="utf-8"),
-            "test_full":    open(out_dir / "test_full.txt",  "w", encoding="utf-8"),
-            # Train-only: clean (no matches) and matched (just matches)
-            "train_clean":   open(out_dir / "train_clean.txt",   "w", encoding="utf-8"),
-            "train_matched": open(out_dir / "train_matched.txt", "w", encoding="utf-8"),
+            "train_full":    open(out_dir / "train_full.txt",     "w", encoding="utf-8"),
+            "dev_full":      open(out_dir / "dev_full.txt",       "w", encoding="utf-8"),
+            "test_full":     open(out_dir / "test_full.txt",      "w", encoding="utf-8"),
+            "train_clean":   open(out_dir / "train_clean.txt",    "w", encoding="utf-8"),
+            "train_matched": open(out_dir / "train_matched.txt",  "w", encoding="utf-8"),
         }
 
         stats = {s: {"matched": 0, "total": 0} for s in ("train", "dev", "test")}
@@ -132,14 +126,10 @@ class FilterPipeline:
                     stats[split]["matched"] += 1
                     sent.metadata["phenomenon"] = self.filter.name
 
-                serialized = sent.serialize()
                 text = sent.metadata.get("text", "") + "\n"
 
-                # Always: write labelled .conllu and full .txt for all splits
-                files[f"{split}_conllu"].write(serialized)
                 files[f"{split}_full"].write(text)
 
-                # Train-only: split into clean / matched
                 if split == "train":
                     if is_match:
                         files["train_matched"].write(text)
@@ -160,7 +150,6 @@ class FilterPipeline:
 
 
 def run_filters(filters, input_path, output_dir="output/", **kwargs):
-    """Run multiple filters sequentially on the same input."""
     for i, f in enumerate(filters, 1):
         print(f"\n{'='*60}")
         print(f"[{i}/{len(filters)}] Running filter: {f.name}")
@@ -175,3 +164,17 @@ def run_filters(filters, input_path, output_dir="output/", **kwargs):
             traceback.print_exc()
             continue
 
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True, help="Path to input (pickle, conllu file, or UD dir)")
+    parser.add_argument("--output", required=True, help="Output directory")
+    args = parser.parse_args()
+
+    filters = [
+        ExistentialThereQuantifierFilter(),
+        BindingReflexive(),
+        InterrogativeWhModifierFilter(),
+        LicensedNPI()
+    ]
+    run_filters(filters, args.input, output_dir=args.output)
