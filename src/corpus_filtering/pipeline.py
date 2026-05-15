@@ -10,15 +10,12 @@ import argparse
 
 class FilterPipeline:
     def __init__(self, filter: CorpusFilter, output_dir: str = "output/",
-                 train_ratio: float = 0.90, dev_ratio: float = 0.05,
-                 seed: int = 42, shuffle: bool = True):
+                 train_ratio: float = 0.90,
+                 seed: int = 42):
         self.filter = filter
         self.output_dir = Path(output_dir)
         self.train_ratio = train_ratio
-        self.dev_ratio = dev_ratio
-        self.test_ratio = 1.0 - train_ratio - dev_ratio
         self.seed = seed
-        self.shuffle = shuffle
 
     def _read_conllu(self, path):
         with open(path, "r", encoding="utf-8") as f:
@@ -45,12 +42,12 @@ class FilterPipeline:
         path = Path(input_path)
         if path.suffix in (".pkl", ".pickle"):
             print(f"Input is a pickle")
-            self._run_from_pickle(path)  # BUG FIX: was self.run_from_ud
+            self._run_from_pickle(path)
         elif path.is_dir():
             print(f"Input is a directory — treating as UD corpus")
             self._run_from_ud(path)
         elif path.is_file():
-            print(f"Input is a single file — splitting into train/dev/test")
+            print(f"Input is a single file — splitting into train/test")
             self._run_from_single_file(path)
         else:
             raise FileNotFoundError(f"{input_path} is neither a file nor a directory")
@@ -63,12 +60,9 @@ class FilterPipeline:
         rng = random.Random(self.seed)
 
         def stream():
-            for sent in sentences:  # BUG FIX: was self.sentences
-                r = rng.random()
-                if r < self.train_ratio:
+            for sent in sentences:
+                if rng.random() < self.train_ratio:
                     yield "train", sent
-                elif r < self.train_ratio + self.dev_ratio:
-                    yield "dev", sent
                 else:
                     yield "test", sent
 
@@ -83,7 +77,7 @@ class FilterPipeline:
             for sent in self._read_conllu(train_file):
                 yield "train", sent
             for sent in self._read_conllu(dev_file):
-                yield "dev", sent
+                yield "train", sent  # merge dev into train
             for sent in self._read_conllu(test_file):
                 yield "test", sent
 
@@ -94,73 +88,73 @@ class FilterPipeline:
 
         def stream():
             for sent in self._read_conllu(input_path):
-                r = rng.random()
-                if r < self.train_ratio:
+                if rng.random() < self.train_ratio:
                     yield "train", sent
-                elif r < self.train_ratio + self.dev_ratio:
-                    yield "dev", sent
                 else:
                     yield "test", sent
 
         self._process_stream(stream())
 
-def _process_stream(self, sentence_stream):
-    MAX_BUFFER = 256 * 1024
-    out_dir = self.output_dir / self.filter.name
-    out_dir.mkdir(parents=True, exist_ok=True)
+    def _process_stream(self, sentence_stream):
+        MAX_BUFFER = 256 * 1024
+        out_dir = self.output_dir / self.filter.name
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    files = {
-        "train_clean":   open(out_dir / "train_clean.txt",   "w", encoding="utf-8"),
-        "train_matched": open(out_dir / "train_matched.txt", "w", encoding="utf-8"),
-        "test_clean":    open(out_dir / "test_clean.txt",    "w", encoding="utf-8"),
-        "test_matched":  open(out_dir / "test_matched.txt",  "w", encoding="utf-8"),
-    }
+        files = {
+            "train_clean":   open(out_dir / "train_clean.txt",   "w", encoding="utf-8"),
+            "train_matched": open(out_dir / "train_matched.txt", "w", encoding="utf-8"),
+            "train_full":    open(out_dir / "train_full.txt",    "w", encoding="utf-8"),
+            "test":          open(out_dir / "test.txt",          "w", encoding="utf-8"),
+        }
 
-    stats = {s: {"matched": 0, "total": 0} for s in ("train", "test")}
+        stats = {s: {"matched": 0, "total": 0} for s in ("train", "test")}
 
-    try:
         buffers = {
             "train_clean":   [],
             "train_matched": [],
-            "test_clean":    [],
-            "test_matched":  [],
+            "train_full":    [],
+            "test":          [],
         }
-        for i, (split, sent) in enumerate(sentence_stream):
-            if split == "dev":
-                continue
-            is_match = self.filter._exclude_sent(sent)
-            stats[split]["total"] += 1
-            if is_match:
-                stats[split]["matched"] += 1
-                sent.metadata["phenomenon"] = self.filter.name
 
-            text = sent.metadata.get("text", "") + "\n"
+        try:
+            for i, (split, sent) in enumerate(sentence_stream):
+                text = sent.metadata.get("text", "") + "\n"
 
-            if is_match:
-                buffers[f"{split}_matched"].append(text)
-            else:
-                buffers[f"{split}_clean"].append(text)
+                if split == "test":
+                    buffers["test"].append(text)
+                else:
+                    is_match = self.filter._exclude_sent(sent)
+                    stats["train"]["total"] += 1
+                    if is_match:
+                        stats["train"]["matched"] += 1
+                        sent.metadata["phenomenon"] = self.filter.name
+                    buffers["train_full"].append(text)
+                    if is_match:
+                        buffers["train_matched"].append(text)
+                    else:
+                        buffers["train_clean"].append(text)
 
-            if (i + 1) % 100_000 == 0:
-                print(f"  Processed {i + 1:,} sentences", flush=True)
+                if (i + 1) % 100_000 == 0:
+                    print(f"  Processed {i + 1:,} sentences", flush=True)
 
-            for split_name, buffer in buffers.items():
-                if len(buffer) > MAX_BUFFER:
-                    files[split_name].write(''.join(buffer))
-                    buffers[split_name] = []
+                for split_name, buffer in buffers.items():
+                    if len(buffer) > MAX_BUFFER:
+                        files[split_name].write(''.join(buffer))
+                        buffers[split_name] = []
 
-    finally:
-        for key, buffer in buffers.items():
-            if buffer:
-                files[key].write(''.join(buffer))
-        for f in files.values():
-            f.close()
+        finally:
+            for key, buffer in buffers.items():
+                if buffer:
+                    files[key].write(''.join(buffer))
+            for f in files.values():
+                f.close()
 
-    for split, s in stats.items():
-        rate = s["matched"] / s["total"] if s["total"] else 0
-        print(f"{split.capitalize():5}: {s['matched']:,} matched / {s['total']:,} total ({rate:.2%})")
+        for split, s in stats.items():
+            rate = s["matched"] / s["total"] if s["total"] else 0
+            print(f"{split.capitalize():5}: {s['matched']:,} matched / {s['total']:,} total ({rate:.2%})")
 
-    self._write_stats(stats, out_dir / "stats.json")
+        self._write_stats(stats, out_dir / "stats.json")
+
 
 def run_filters(filters, input_path, output_dir="output/", **kwargs):
     for i, f in enumerate(filters, 1):
