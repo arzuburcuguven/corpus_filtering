@@ -105,6 +105,7 @@ class FilterPipeline:
         self._process_stream(stream())
 
     def _process_stream(self, sentence_stream):
+        MAX_BUFFER = 256 * 1024
         out_dir = self.output_dir / self.filter.name
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -119,6 +120,13 @@ class FilterPipeline:
         stats = {s: {"matched": 0, "total": 0} for s in ("train", "dev", "test")}
 
         try:
+            buffers = {
+                "train_full":[],
+                "dev_full":[],
+                "test_full":[],
+                "train_clean":[],
+                "train_matched":[],
+            }
             for i, (split, sent) in enumerate(sentence_stream):
                 is_match = self.filter._exclude_sent(sent)
                 stats[split]["total"] += 1
@@ -128,17 +136,28 @@ class FilterPipeline:
 
                 text = sent.metadata.get("text", "") + "\n"
 
-                files[f"{split}_full"].write(text)
+
 
                 if split == "train":
                     if is_match:
-                        files["train_matched"].write(text)
+                        #files["train_matched"].write(text)
+                        buffers["train_matched"].append(text)
                     else:
-                        files["train_clean"].write(text)
+                        #files["train_clean"].write(text)
+                        buffers["train_clean"].append(text)
 
                 if (i + 1) % 100_000 == 0:
                     print(f"  Processed {i + 1:,} sentences", flush=True)
+
+                for split_name, buffer in buffers.items():
+                    if len(buffer) > MAX_BUFFER:
+                        files[split_name].write(''.join(buffer))
+                        buffers[split_name] = []
+
         finally:
+            for key, buffer in buffers.items():
+                if buffer:
+                    files[key].write(''.join(buffer))
             for f in files.values():
                 f.close()
 
