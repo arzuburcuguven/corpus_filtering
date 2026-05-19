@@ -186,7 +186,7 @@ class BindingReflexive(CorpusFilter):
             feats = tok.get("feats") or {}
             if feats.get("Reflex") == "Yes":
                 return True
-            if tok.get("lemma") in self.reflexives:
+            if (tok.get("form") or "").lower() in self.reflexives:
                 return True
         return False
 
@@ -278,4 +278,22 @@ class LicensedNPI(CorpusFilter):
                 return True
 
         return False
-    
+
+
+class NukeNPI(CorpusFilter):
+
+    NPI_forms = {
+        "any", "ever", "remotely", "exactly", "squat", "yet",
+        "anymore", "anyone", "anywhere", "anything", "anybody",
+    }
+
+    @property
+    def name(self) -> str:
+        return "nuke-npi"
+
+    def _exclude_sent(self, sent: TokenList) -> bool:
+        return any(
+            (tok.get("form") or "").lower() in self.NPI_forms
+            for tok in sent
+            if isinstance(tok["id"], int)
+        )
