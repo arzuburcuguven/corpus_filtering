@@ -5,6 +5,96 @@ from typing import Callable, Iterable
 
 from corpus_filtering.filters.base import CorpusFilter
 
+# ── BEAR facts filter ─────────────────────────────────────────────────────────
+
+
+def _build_bear_match_fn(
+    pairs_with_aliases: list[tuple[list[str], list[str]]],
+) -> Callable[[str], bool]:
+    """Return a function that returns True when any (subject, object) pair
+    co-occurs in the sentence.
+
+    pairs_with_aliases: list of (subject_surface_forms, object_surface_forms).
+    Each surface-form list should include the canonical label plus any Wikidata
+    aliases.  The matching logic mirrors _build_match_fn: scan for the object
+    first (as the more distinctive term) then verify the subject is present.
+    """
+    records = []
+    for subj_terms, obj_terms in pairs_with_aliases:
+        subj_cs, subj_ci = _split_case(subj_terms)
+        obj_cs, obj_ci = _split_case(obj_terms)
+        if not (subj_cs or subj_ci) or not (obj_cs or obj_ci):
+            continue
+        records.append({
+            "subj_cs": subj_cs,
+            "subj_ci": subj_ci,
+            "obj_cs": obj_cs,
+            "obj_ci": obj_ci,
+        })
+
+    all_obj_ci = sorted({t for r in records for t in r["obj_ci"]}, key=len, reverse=True)
+    all_obj_cs = sorted({t for r in records for t in r["obj_cs"]}, key=len, reverse=True)
+    obj_re_ci = _compile_alt(all_obj_ci, re.IGNORECASE)
+    obj_re_cs = _compile_alt(all_obj_cs, 0)
+
+    obj_to_records: dict[str, list] = defaultdict(list)
+    for r in records:
+        for t in r["obj_ci"]:
+            obj_to_records[t].append(r)
+        for t in r["obj_cs"]:
+            obj_to_records[t].append(r)
+
+    def _subj_present(text_raw: str, text_lower: str, rec: dict) -> bool:
+        for t in rec["subj_cs"]:
+            if re.search(r"(?<!\w)" + re.escape(t) + r"(?!\w)", text_raw):
+                return True
+        for t in rec["subj_ci"]:
+            if re.search(r"(?<!\w)" + re.escape(t) + r"(?!\w)", text_lower):
+                return True
+        return False
+
+    def match(text: str) -> bool:
+        if not text:
+            return False
+        text_lower = text.lower()
+        if obj_re_ci is not None:
+            for m in obj_re_ci.finditer(text_lower):
+                for rec in obj_to_records.get(m.group(0), []):
+                    if _subj_present(text, text_lower, rec):
+                        return True
+        if obj_re_cs is not None:
+            for m in obj_re_cs.finditer(text):
+                for rec in obj_to_records.get(m.group(0), []):
+                    if _subj_present(text, text_lower, rec):
+                        return True
+        return False
+
+    return match
+
+
+class BearFactsFilter(CorpusFilter):
+    """Marks sentences where a confidently-learned BEAR subject and object co-occur.
+
+    Accepts pairs_with_aliases: a list of (subject_terms, object_terms) where
+    each element is a list of surface forms (canonical label + Wikidata aliases).
+    """
+
+    def __init__(
+        self,
+        pairs_with_aliases: list[tuple[list[str], list[str]]],
+        name: str = "BearFacts",
+    ) -> None:
+        self._match = _build_bear_match_fn(pairs_with_aliases)
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def _exclude_sent(self, sent) -> bool:
+        text = sent.metadata.get("text", "")
+        return self._match(text)
+
 # Mirrors data/capitals_pairs.csv — update both if pairs change.
 _PAIRS = [
     ("France", "Paris"),
@@ -461,3 +551,37 @@ _HISTORICAL_CAPITALS: dict[str, list[str]] = {
     "Greece": ["Nafplio"],
     "Poland": ["Krakow", "Kraków"],
 }
+
+
+def get_predefined_aliases(label: str) -> list[str]:
+    """Return any predefined surface forms for a label, or an empty list.
+
+    Checks _COUNTRY_ALIASES, _DEMONYMS_EXPANDED, _CAPITAL_ALIASES (values),
+    and _HISTORICAL_CAPITALS (values) so that BEAR entities which overlap with
+    the capital-facts vocabulary get their full alias coverage for free.
+    """
+    terms: list[str] = []
+
+    # Country label → country surface forms + demonyms
+    if label in _COUNTRY_ALIASES:
+        terms.extend(_COUNTRY_ALIASES[label])
+    if label in _DEMONYMS_EXPANDED:
+        terms.extend(_DEMONYMS_EXPANDED[label])
+
+    # Capital label → find which country it belongs to, add capital aliases
+    for caps in _CAPITAL_ALIASES.values():
+        if label in caps:
+            terms.extend(caps)
+            break
+
+    # Historical capital label → same treatment
+    for hist_caps in _HISTORICAL_CAPITALS.values():
+        if label in hist_caps:
+            terms.extend(hist_caps)
+            break
+
+    # Always include the label itself
+    if label not in terms:
+        terms.insert(0, label)
+
+    return list(dict.fromkeys(terms))  # deduplicate, preserve order
