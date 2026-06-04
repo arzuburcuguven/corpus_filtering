@@ -1,9 +1,16 @@
 """Filter a corpus based on BEAR facts the model has genuinely learned.
 
-A fact qualifies if it passes the two-step gate in the evaluation results:
-  1. rank_correct == 1  (raw PLL — necessary condition)
-  2. pmi_correct == True (PMI-normalised — fact-specific signal)
-  3. pmi_entropy_norm < threshold (confident after prior removal)
+A fact qualifies when ALL of the following hold:
+
+  Model conditions (from check_pretrained results JSON):
+    1. rank_correct == 1  — model's top prediction is the correct answer
+    2. p_correct >= p-correct-threshold  — model assigns enough probability mass
+    3. entropy_norm < entropy-threshold  — prediction is confident (not uniform)
+
+  Corpus conditions (from bear_corpus_stats JSON, optional):
+    4. subject occurrence count   >= min-subject-count
+    5. object occurrence count    >= min-object-count
+    6. co-occurrence line count   >= min-cooccur-count
 
 For each qualifying (subject, object) pair, Wikidata aliases are fetched once
 and cached.  The filter then marks any sentence where both the subject and
@@ -23,7 +30,8 @@ python run_bear_facts_filter.py \
     --output /path/to/output/ \
     --results /path/to/results.json \
     --alias-cache /path/to/cache.json \
-    --pmi-entropy-threshold 0.5
+    --corpus-stats /path/to/bear_corpus_stats.json \
+    --corpus-dataset 10b
 """
 
 from __future__ import annotations
@@ -128,11 +136,51 @@ def fetch_aliases(
 # ── Results parsing ───────────────────────────────────────────────────────────
 
 
+def load_bear_subject_aliases() -> dict[str, list[str]]:
+    """Return {sub_label: [alias, ...]} from the lm_pub_quiz BEAR dataset."""
+    from lm_pub_quiz import Dataset
+    result: dict[str, list[str]] = {}
+    for relation in Dataset.from_name("BEAR"):
+        for _, row in relation.instance_table.iterrows():
+            label = str(row["sub_label"])
+            aliases = row.get("sub_aliases", [])
+            if not isinstance(aliases, list):
+                aliases = []
+            existing = result.setdefault(label, [])
+            for a in aliases:
+                a = str(a)
+                if a not in existing:
+                    existing.append(a)
+    return result
+
+
+def load_corpus_stats(
+    stats_path: Path | None,
+    dataset: str,
+) -> dict[tuple[str, str], dict]:
+    """Return {(subject, correct_object): {subject, object, cooccur}} for one dataset."""
+    if stats_path is None or not stats_path.exists():
+        return {}
+    with open(stats_path, encoding="utf-8") as f:
+        data = json.load(f)
+    lookup: dict[tuple[str, str], dict] = {}
+    for rel_data in data.get("relations", {}).values():
+        for inst in rel_data.get("instances", []):
+            key = (inst["subject"], inst["correct_object"])
+            lookup[key] = inst.get("by_dataset", {}).get(dataset, {})
+    return lookup
+
+
 def load_qualifying_pairs(
     results_path: Path,
-    pmi_entropy_threshold: float,
+    p_correct_threshold: float,
+    entropy_threshold: float,
+    corpus_lookup: dict[tuple[str, str], dict],
+    min_subject_count: int,
+    min_object_count: int,
+    min_cooccur_count: int,
 ) -> list[tuple[str, str]]:
-    """Return (subject, correct_object) pairs that passed the two-step gate."""
+    """Return (subject, correct_object) pairs that pass all quality gates."""
     with open(results_path, encoding="utf-8") as f:
         data = json.load(f)
 
@@ -140,19 +188,30 @@ def load_qualifying_pairs(
     bear = data.get("results", {}).get("bear", data)
 
     pairs: list[tuple[str, str]] = []
-    skipped_no_pmi = 0
+    n_total = n_low_p = n_high_entropy = n_corpus = 0
     for rel_data in bear.get("by_relation", {}).values():
+        # correct_facts already guarantees rank_correct == 1
         for fact in rel_data.get("correct_facts", []):
-            if not fact.get("pmi_correct", False):
-                skipped_no_pmi += 1
+            n_total += 1
+            if fact.get("p_correct", 0.0) < p_correct_threshold:
+                n_low_p += 1
                 continue
-            if fact.get("pmi_entropy_norm", 1.0) >= pmi_entropy_threshold:
+            if fact.get("entropy_norm", 1.0) >= entropy_threshold:
+                n_high_entropy += 1
                 continue
+            if corpus_lookup:
+                key = (fact["subject"], fact["correct_object"])
+                stats = corpus_lookup.get(key, {})
+                if (stats.get("subject", 0) < min_subject_count
+                        or stats.get("object", 0) < min_object_count
+                        or stats.get("cooccur", 0) < min_cooccur_count):
+                    n_corpus += 1
+                    continue
             pairs.append((fact["subject"], fact["correct_object"]))
 
-    if skipped_no_pmi:
-        print(f"  Skipped {skipped_no_pmi} facts without pmi_correct "
-              f"(relations without null templates)")
+    print(f"  Qualifying facts: {len(pairs)} / {n_total}")
+    print(f"  Dropped — low p_correct: {n_low_p}, high entropy: {n_high_entropy}, "
+          f"corpus threshold: {n_corpus}")
     return pairs
 
 
@@ -176,8 +235,33 @@ def main() -> None:
              "Defaults to wikidata_alias_cache.json next to the results file.",
     )
     parser.add_argument(
-        "--pmi-entropy-threshold", type=float, default=0.5, metavar="T",
-        help="Maximum pmi_entropy_norm for a fact to qualify (lower = more confident).",
+        "--p-correct-threshold", type=float, default=0.1, metavar="T",
+        help="Minimum p_correct for a fact to qualify (model's probability on the correct answer).",
+    )
+    parser.add_argument(
+        "--entropy-threshold", type=float, default=0.8, metavar="T",
+        help="Maximum entropy_norm for a fact to qualify (lower = more confident).",
+    )
+    parser.add_argument(
+        "--corpus-stats", default=None, metavar="PATH",
+        help="Path to bear_corpus_stats.json produced by bear_corpus_cooccurrence.py. "
+             "When provided, corpus occurrence thresholds are applied.",
+    )
+    parser.add_argument(
+        "--corpus-dataset", default="10b", metavar="DATASET",
+        help="Which dataset column to use from --corpus-stats (default: 10b).",
+    )
+    parser.add_argument(
+        "--min-subject-count", type=int, default=5, metavar="N",
+        help="Minimum corpus lines containing the subject.",
+    )
+    parser.add_argument(
+        "--min-object-count", type=int, default=5, metavar="N",
+        help="Minimum corpus lines containing the correct object.",
+    )
+    parser.add_argument(
+        "--min-cooccur-count", type=int, default=1, metavar="N",
+        help="Minimum corpus lines where subject and object co-occur.",
     )
     parser.add_argument(
         "--prefetch-only", action="store_true",
@@ -195,16 +279,30 @@ def main() -> None:
 
     # ── 1. Extract qualifying facts ───────────────────────────────────────────
     print(f"Loading results from {results_path}")
-    pairs = load_qualifying_pairs(results_path, args.pmi_entropy_threshold)
-    print(f"Qualifying facts (pmi_correct=True, pmi_entropy_norm<{args.pmi_entropy_threshold}): "
-          f"{len(pairs)}")
+    corpus_stats_path = Path(args.corpus_stats) if args.corpus_stats else None
+    corpus_lookup = load_corpus_stats(corpus_stats_path, args.corpus_dataset)
+    if corpus_stats_path:
+        print(f"Corpus stats: {corpus_stats_path} (dataset={args.corpus_dataset}, "
+              f"{len(corpus_lookup)} entries)")
+    pairs = load_qualifying_pairs(
+        results_path,
+        p_correct_threshold=args.p_correct_threshold,
+        entropy_threshold=args.entropy_threshold,
+        corpus_lookup=corpus_lookup,
+        min_subject_count=args.min_subject_count,
+        min_object_count=args.min_object_count,
+        min_cooccur_count=args.min_cooccur_count,
+    )
     if not pairs:
-        print("No qualifying facts — nothing to filter.")
+        print("No qualifying facts after filtering — nothing to do.")
         return
 
-    # ── 2. Fetch Wikidata aliases ─────────────────────────────────────────────
+    # ── 2. Fetch aliases ──────────────────────────────────────────────────────
     all_labels = list({label for pair in pairs for label in pair})
     print(f"Unique entity labels: {len(all_labels)}")
+    print("Loading BEAR subject aliases from lm_pub_quiz ...")
+    bear_aliases = load_bear_subject_aliases()
+    print(f"  {len(bear_aliases)} subjects with aliases")
     alias_map = fetch_aliases(all_labels, cache_path)
 
     if args.prefetch_only:
@@ -217,8 +315,9 @@ def main() -> None:
     # ── 3. Build filter and run pipeline ─────────────────────────────────────
     def _merge(label: str) -> list[str]:
         wikidata = alias_map.get(label, [label])
+        bear = bear_aliases.get(label, [])
         predefined = get_predefined_aliases(label)
-        return list(dict.fromkeys(wikidata + predefined))  # deduplicate, wikidata first
+        return list(dict.fromkeys(wikidata + bear + predefined))  # deduplicate, wikidata first
 
     pairs_with_aliases = [
         (_merge(subj), _merge(obj))
