@@ -71,11 +71,11 @@ def _wikidata_search(label: str) -> str | None:
 
 
 def _wikidata_aliases(qid: str) -> list[str]:
-    """Return English label + all English aliases for a Q-ID."""
+    """Return English label + all English aliases + demonyms (P1549) for a Q-ID."""
     params = urllib.parse.urlencode({
         "action": "wbgetentities",
         "ids": qid,
-        "props": "labels|aliases",
+        "props": "labels|aliases|claims",
         "languages": "en",
         "format": "json",
     })
@@ -88,6 +88,15 @@ def _wikidata_aliases(qid: str) -> list[str]:
         terms.append(label)
     for alias in entity.get("aliases", {}).get("en", []):
         terms.append(alias["value"])
+    for claim in entity.get("claims", {}).get("P1549", []):
+        mainsnak = claim.get("mainsnak", {})
+        if mainsnak.get("snaktype") != "value":
+            continue
+        val = mainsnak.get("datavalue", {}).get("value", {})
+        if isinstance(val, dict) and val.get("language") == "en":
+            text = val.get("text")
+            if text:
+                terms.append(text)
     return terms
 
 
