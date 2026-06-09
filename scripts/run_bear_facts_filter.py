@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 import urllib.parse
@@ -46,10 +47,40 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.corpus_filtering.filters.facts import BearFactsFilter, get_predefined_aliases
+from src.corpus_filtering.filters.facts import BearFactsFilter, _build_bear_match_fn, get_predefined_aliases
 from src.corpus_filtering.pipeline import run_filters
 
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
+
+
+# ── Alias overlap helpers ─────────────────────────────────────────────────────
+
+
+def _aliases_overlap(
+    subj_label: str,
+    obj_label: str,
+    subj_aliases: list[str],
+    obj_aliases: list[str],
+) -> bool:
+    """True if subject and object likely refer to the same or strongly related entity.
+
+    Two checks:
+      1. Exact case-insensitive alias intersection — catches Italy/Italian via
+         Wikidata P1549 demonyms (Italy's alias list includes "Italian").
+      2. Whole-word substring match on the canonical labels — catches
+         Mexico/Mexico City (the string "mexico" appears as a whole word in
+         "mexico city").
+    """
+    subj_set = {a.lower() for a in subj_aliases}
+    obj_set = {a.lower() for a in obj_aliases}
+    if subj_set & obj_set:
+        return True
+    s, o = subj_label.lower(), obj_label.lower()
+    if len(s) >= 4 and re.search(r"\b" + re.escape(s) + r"\b", o):
+        return True
+    if len(o) >= 4 and re.search(r"\b" + re.escape(o) + r"\b", s):
+        return True
+    return False
 
 
 # ── Wikidata helpers ──────────────────────────────────────────────────────────
@@ -188,17 +219,17 @@ def load_qualifying_pairs(
     min_subject_count: int,
     min_object_count: int,
     min_cooccur_count: int,
-) -> list[tuple[str, str]]:
-    """Return (subject, correct_object) pairs that pass all quality gates."""
+) -> list[tuple[str, str, str]]:
+    """Return (subject, correct_object, rel_id) triplets that pass all quality gates."""
     with open(results_path, encoding="utf-8") as f:
         data = json.load(f)
 
     # Handle both a full check_pretrained results file and a bare bear dict
     bear = data.get("results", {}).get("bear", data)
 
-    pairs: list[tuple[str, str]] = []
+    pairs: list[tuple[str, str, str]] = []
     n_total = n_low_p = n_high_entropy = n_corpus = 0
-    for rel_data in bear.get("by_relation", {}).values():
+    for rel_id, rel_data in bear.get("by_relation", {}).items():
         # correct_facts already guarantees rank_correct == 1
         for fact in rel_data.get("correct_facts", []):
             n_total += 1
@@ -216,12 +247,64 @@ def load_qualifying_pairs(
                         or stats.get("cooccur", 0) < min_cooccur_count):
                     n_corpus += 1
                     continue
-            pairs.append((fact["subject"], fact["correct_object"]))
+            pairs.append((fact["subject"], fact["correct_object"], rel_id))
 
     print(f"  Qualifying facts: {len(pairs)} / {n_total}")
     print(f"  Dropped — low p_correct: {n_low_p}, high entropy: {n_high_entropy}, "
           f"corpus threshold: {n_corpus}")
     return pairs
+
+
+def _fact_slug(rel_id: str, subj: str, obj: str) -> str:
+    """Stable filesystem-safe slug for a (rel_id, subject, object) triplet."""
+    def _safe(s: str) -> str:
+        return re.sub(r"[^a-z0-9_]", "", s.lower().replace(" ", "_").replace("-", "_"))
+    return f"{rel_id}__{_safe(subj)}__{_safe(obj)}"
+
+
+def _write_per_fact_files(
+    output_dir: Path,
+    pairs: list[tuple[str, str, str]],
+    pairs_with_aliases: list[tuple[list[str], list[str]]],
+) -> None:
+    """Write per-fact train_matched.txt files under output_dir/BearFacts/facts/<slug>/."""
+    matched_txt = output_dir / "BearFacts" / "train_matched.txt"
+    if not matched_txt.exists():
+        print(f"  Per-fact split: no train_matched.txt found at {matched_txt}, skipping.")
+        return
+
+    lines = [l for l in matched_txt.read_text(encoding="utf-8").splitlines() if l.strip()]
+    if not lines:
+        print("  Per-fact split: train_matched.txt is empty, skipping.")
+        return
+
+    # Build per-fact match functions (one BearFactsFilter per qualifying fact)
+    slugs_and_fns = []
+    for (subj, obj, rel_id), (subj_terms, obj_terms) in zip(pairs, pairs_with_aliases):
+        slug = _fact_slug(rel_id, subj, obj)
+        fn = _build_bear_match_fn([(subj_terms, obj_terms)])
+        slugs_and_fns.append((slug, fn))
+
+    # Assign each matched line to all facts it co-occurs with
+    fact_lines: dict[str, list[str]] = {}
+    for line in lines:
+        for slug, fn in slugs_and_fns:
+            if fn(line):
+                fact_lines.setdefault(slug, []).append(line)
+
+    # Write per-fact files
+    n_written = 0
+    for slug, fact_matched in fact_lines.items():
+        out = output_dir / "BearFacts" / "facts" / slug
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "train_matched.txt").write_text(
+            "\n".join(fact_matched) + "\n", encoding="utf-8"
+        )
+        n_written += 1
+
+    n_empty = len(slugs_and_fns) - n_written
+    print(f"  Per-fact files: {n_written}/{len(slugs_and_fns)} facts have matched sentences "
+          f"({n_empty} with zero matches)")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -277,6 +360,13 @@ def main() -> None:
         help="Only build the alias cache and exit — do not run the corpus filter. "
              "Run this once before submitting the slurm array.",
     )
+    parser.add_argument(
+        "--exclude-alias-overlap", action="store_true",
+        help="Remove facts whose subject and object share a Wikidata alias or where "
+             "one canonical label contains the other as a whole word (e.g. Italy/Italian "
+             "via P1549 demonym, Mexico/Mexico City via substring). Applied after alias "
+             "cache is built.",
+    )
     args = parser.parse_args()
 
     results_path = Path(args.results)
@@ -307,12 +397,29 @@ def main() -> None:
         return
 
     # ── 2. Fetch aliases ──────────────────────────────────────────────────────
-    all_labels = list({label for pair in pairs for label in pair})
+    all_labels = list({label for subj, obj, _ in pairs for label in (subj, obj)})
     print(f"Unique entity labels: {len(all_labels)}")
     print("Loading BEAR subject aliases from lm_pub_quiz ...")
     bear_aliases = load_bear_subject_aliases()
     print(f"  {len(bear_aliases)} subjects with aliases")
     alias_map = fetch_aliases(all_labels, cache_path)
+
+    # ── 2b. Alias overlap filter ──────────────────────────────────────────────
+    if args.exclude_alias_overlap:
+        n_before = len(pairs)
+        pairs = [
+            (subj, obj, rel_id) for subj, obj, rel_id in pairs
+            if not _aliases_overlap(
+                subj, obj,
+                alias_map.get(subj, [subj]),
+                alias_map.get(obj, [obj]),
+            )
+        ]
+        print(f"  Alias-overlap filter: {n_before - len(pairs)} pairs removed, "
+              f"{len(pairs)} remain")
+        if not pairs:
+            print("No qualifying facts after alias-overlap check — exiting.")
+            return
 
     if args.prefetch_only:
         print("--prefetch-only: alias cache built. Exiting.")
@@ -330,11 +437,15 @@ def main() -> None:
 
     pairs_with_aliases = [
         (_merge(subj), _merge(obj))
-        for subj, obj in pairs
+        for subj, obj, _ in pairs
     ]
     bear_filter = BearFactsFilter(pairs_with_aliases)
     print(f"\nRunning BearFacts filter over {args.input}")
     run_filters([bear_filter], args.input, output_dir=args.output)
+
+    # Write per-fact matched files under BearFacts/facts/<slug>/train_matched.txt
+    print(f"\nWriting per-fact matched files ...")
+    _write_per_fact_files(Path(args.output), pairs, pairs_with_aliases)
 
 
 if __name__ == "__main__":
