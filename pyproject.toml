@@ -5,6 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "corpus_filtering"
 version = "0.1.0"
+dependencies = [
+    "lm-pub-quiz>=0.3.3",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
