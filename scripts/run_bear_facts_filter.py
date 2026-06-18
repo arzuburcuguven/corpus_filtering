@@ -255,6 +255,15 @@ def load_qualifying_pairs(
     return pairs
 
 
+def _write_excluded_facts(path: Path, pairs: list[tuple[str, str, str]]) -> None:
+    """Write the final qualifying (subject, object, rel_id) triplets as a JSON manifest."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = [{"rel_id": rel_id, "subject": subj, "object": obj} for subj, obj, rel_id in pairs]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"  Excluded facts manifest: {path} ({len(payload)} facts)")
+
+
 def _fact_slug(rel_id: str, subj: str, obj: str) -> str:
     """Stable filesystem-safe slug for a (rel_id, subject, object) triplet."""
     def _safe(s: str) -> str:
@@ -356,6 +365,11 @@ def main() -> None:
         help="Minimum corpus lines where subject and object co-occur.",
     )
     parser.add_argument(
+        "--excluded-facts-output", default=None, metavar="PATH",
+        help="If set, write the final qualifying (excluded-from-training) facts as a JSON "
+             "manifest to this path.",
+    )
+    parser.add_argument(
         "--prefetch-only", action="store_true",
         help="Only build the alias cache and exit — do not run the corpus filter. "
              "Run this once before submitting the slurm array.",
@@ -420,6 +434,9 @@ def main() -> None:
         if not pairs:
             print("No qualifying facts after alias-overlap check — exiting.")
             return
+
+    if args.excluded_facts_output:
+        _write_excluded_facts(Path(args.excluded_facts_output), pairs)
 
     if args.prefetch_only:
         print("--prefetch-only: alias cache built. Exiting.")
