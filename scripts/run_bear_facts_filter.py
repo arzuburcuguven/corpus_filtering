@@ -1,6 +1,9 @@
 """Filter a corpus based on BEAR facts the model has genuinely learned.
 
-A fact qualifies when ALL of the following hold:
+check_pretrained evaluates BEAR per template, so a "fact" here is a
+(subject, correct_object) pair within one relation, and a relation has
+several templates. A fact qualifies when ALL of the following hold on
+EVERY one of the relation's templates (not just one):
 
   Model conditions (from check_pretrained results JSON):
     1. rank_correct == 1  — model's top prediction is the correct answer
@@ -47,7 +50,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.corpus_filtering.filters.facts import BearFactsFilter, _build_bear_match_fn, get_predefined_aliases
+from src.corpus_filtering.filters.facts import (
+    BearFactsFilter,
+    _build_bear_match_fn,
+    _build_subject_match_fn,
+    get_predefined_aliases,
+)
 from src.corpus_filtering.pipeline import run_filters
 
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
@@ -220,7 +228,12 @@ def load_qualifying_pairs(
     min_object_count: int,
     min_cooccur_count: int,
 ) -> list[tuple[str, str, str]]:
-    """Return (subject, correct_object, rel_id) triplets that pass all quality gates."""
+    """Return (subject, correct_object, rel_id) triplets that pass all quality gates.
+
+    A pair qualifies only if the model is correct (rank_correct == 1) on
+    EVERY template of the relation, and every one of those per-template
+    entries individually satisfies the p_correct/entropy_norm thresholds.
+    """
     with open(results_path, encoding="utf-8") as f:
         data = json.load(f)
 
@@ -228,30 +241,40 @@ def load_qualifying_pairs(
     bear = data.get("results", {}).get("bear", data)
 
     pairs: list[tuple[str, str, str]] = []
-    n_total = n_low_p = n_high_entropy = n_corpus = 0
+    n_total = n_not_all_correct = n_low_p = n_high_entropy = n_corpus = 0
     for rel_id, rel_data in bear.get("by_relation", {}).items():
-        # correct_facts already guarantees rank_correct == 1
+        # correct_facts already guarantees rank_correct == 1 (per template)
+        correct_by_pair: dict[tuple[str, str], list[dict]] = {}
         for fact in rel_data.get("correct_facts", []):
-            n_total += 1
-            if fact.get("p_correct", 0.0) < p_correct_threshold:
+            correct_by_pair.setdefault((fact["subject"], fact["correct_object"]), []).append(fact)
+        wrong_pairs = {(fact["subject"], fact["correct_object"]) for fact in rel_data.get("wrong_facts", [])}
+
+        n_total += len(correct_by_pair)
+        for key, entries in correct_by_pair.items():
+            if key in wrong_pairs:
+                n_not_all_correct += 1
+                continue
+            if any(e.get("p_correct", 0.0) < p_correct_threshold for e in entries):
                 n_low_p += 1
                 continue
-            if fact.get("entropy_norm", 1.0) >= entropy_threshold:
+            if any(e.get("entropy_norm", 1.0) >= entropy_threshold for e in entries):
                 n_high_entropy += 1
                 continue
             if corpus_lookup:
-                key = (fact["subject"], fact["correct_object"])
                 stats = corpus_lookup.get(key, {})
                 if (stats.get("subject", 0) < min_subject_count
                         or stats.get("object", 0) < min_object_count
                         or stats.get("cooccur", 0) < min_cooccur_count):
                     n_corpus += 1
                     continue
-            pairs.append((fact["subject"], fact["correct_object"], rel_id))
+            subject, correct_object = key
+            pairs.append((subject, correct_object, rel_id))
 
-    print(f"  Qualifying facts: {len(pairs)} / {n_total}")
-    print(f"  Dropped — low p_correct: {n_low_p}, high entropy: {n_high_entropy}, "
+    print(f"  Candidate facts (correct on >=1 template): {n_total}")
+    print(f"  Dropped — not correct on all templates: {n_not_all_correct}, "
+          f"low p_correct: {n_low_p}, high entropy: {n_high_entropy}, "
           f"corpus threshold: {n_corpus}")
+    print(f"  Qualifying facts: {len(pairs)}")
     return pairs
 
 
@@ -275,8 +298,16 @@ def _write_per_fact_files(
     output_dir: Path,
     pairs: list[tuple[str, str, str]],
     pairs_with_aliases: list[tuple[list[str], list[str]]],
+    occurrence_eligible: set[tuple[str, str, str]],
 ) -> None:
-    """Write per-fact train_matched.txt files under output_dir/BearFacts/facts/<slug>/."""
+    """Write per-fact matched files under output_dir/BearFacts/facts/<slug>/.
+
+    Each matched line is checked against the fact's cooccurrence match first;
+    if it matches, it's filed under <slug>/cooccurrence/train_matched.txt.
+    Otherwise, if the fact is occurrence-eligible and the line merely mentions
+    the subject, it's filed under <slug>/subj_occurrence/train_matched.txt.
+    The two files are disjoint per fact by construction.
+    """
     matched_txt = output_dir / "BearFacts" / "train_matched.txt"
     if not matched_txt.exists():
         print(f"  Per-fact split: no train_matched.txt found at {matched_txt}, skipping.")
@@ -287,33 +318,40 @@ def _write_per_fact_files(
         print("  Per-fact split: train_matched.txt is empty, skipping.")
         return
 
-    # Build per-fact match functions (one BearFactsFilter per qualifying fact)
-    slugs_and_fns = []
+    # Build per-fact match functions (cooccurrence always; subject-only when eligible)
+    entries = []
     for (subj, obj, rel_id), (subj_terms, obj_terms) in zip(pairs, pairs_with_aliases):
         slug = _fact_slug(rel_id, subj, obj)
-        fn = _build_bear_match_fn([(subj_terms, obj_terms)])
-        slugs_and_fns.append((slug, fn))
-
-    # Assign each matched line to all facts it co-occurs with
-    fact_lines: dict[str, list[str]] = {}
-    for line in lines:
-        for slug, fn in slugs_and_fns:
-            if fn(line):
-                fact_lines.setdefault(slug, []).append(line)
-
-    # Write per-fact files
-    n_written = 0
-    for slug, fact_matched in fact_lines.items():
-        out = output_dir / "BearFacts" / "facts" / slug
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "train_matched.txt").write_text(
-            "\n".join(fact_matched) + "\n", encoding="utf-8"
+        cooccur_fn = _build_bear_match_fn([(subj_terms, obj_terms)])
+        subj_fn = (
+            _build_subject_match_fn([subj_terms])
+            if (subj, obj, rel_id) in occurrence_eligible
+            else None
         )
-        n_written += 1
+        entries.append((slug, cooccur_fn, subj_fn))
 
-    n_empty = len(slugs_and_fns) - n_written
-    print(f"  Per-fact files: {n_written}/{len(slugs_and_fns)} facts have matched sentences "
-          f"({n_empty} with zero matches)")
+    cooccur_lines: dict[str, list[str]] = {}
+    subj_occur_lines: dict[str, list[str]] = {}
+    for line in lines:
+        for slug, cooccur_fn, subj_fn in entries:
+            if cooccur_fn(line):
+                cooccur_lines.setdefault(slug, []).append(line)
+            elif subj_fn is not None and subj_fn(line):
+                subj_occur_lines.setdefault(slug, []).append(line)
+
+    def _write(bucket: dict[str, list[str]], subdir: str) -> int:
+        n = 0
+        for slug, matched in bucket.items():
+            out = output_dir / "BearFacts" / "facts" / slug / subdir
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "train_matched.txt").write_text("\n".join(matched) + "\n", encoding="utf-8")
+            n += 1
+        return n
+
+    n_cooccur = _write(cooccur_lines, "cooccurrence")
+    n_subj_occur = _write(subj_occur_lines, "subj_occurrence")
+    print(f"  Per-fact files: {n_cooccur}/{len(entries)} facts have cooccurrence matches, "
+          f"{n_subj_occur}/{len(entries)} facts have subj_occurrence matches")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -380,6 +418,13 @@ def main() -> None:
              "one canonical label contains the other as a whole word (e.g. Italy/Italian "
              "via P1549 demonym, Mexico/Mexico City via substring). Applied after alias "
              "cache is built.",
+    )
+    parser.add_argument(
+        "--occurrence-subject-count-threshold", type=int, default=None, metavar="N",
+        help="If set, also remove every sentence merely mentioning the subject (not just "
+             "cooccurring lines) for qualifying facts whose corpus subject-count is below "
+             "this threshold. Requires --corpus-stats. Written to a separate "
+             "<slug>/subj_occurrence/ subfolder per fact, disjoint from <slug>/cooccurrence/.",
     )
     args = parser.parse_args()
 
@@ -456,13 +501,26 @@ def main() -> None:
         (_merge(subj), _merge(obj))
         for subj, obj, _ in pairs
     ]
-    bear_filter = BearFactsFilter(pairs_with_aliases)
+
+    occurrence_eligible: set[tuple[str, str, str]] = set()
+    occurrence_subj_terms: list[list[str]] = []
+    if args.occurrence_subject_count_threshold is not None:
+        threshold = args.occurrence_subject_count_threshold
+        for (subj, obj, rel_id), (subj_terms, _obj_terms) in zip(pairs, pairs_with_aliases):
+            stats = corpus_lookup.get((subj, obj), {})
+            if stats.get("subject", 0) < threshold:
+                occurrence_eligible.add((subj, obj, rel_id))
+                occurrence_subj_terms.append(subj_terms)
+        print(f"  Occurrence-eligible facts (subject_count < {threshold}): "
+              f"{len(occurrence_eligible)} / {len(pairs)}")
+
+    bear_filter = BearFactsFilter(pairs_with_aliases, occurrence_subj_terms or None)
     print(f"\nRunning BearFacts filter over {args.input}")
     run_filters([bear_filter], args.input, output_dir=args.output)
 
-    # Write per-fact matched files under BearFacts/facts/<slug>/train_matched.txt
+    # Write per-fact matched files under BearFacts/facts/<slug>/{cooccurrence,subj_occurrence}/
     print(f"\nWriting per-fact matched files ...")
-    _write_per_fact_files(Path(args.output), pairs, pairs_with_aliases)
+    _write_per_fact_files(Path(args.output), pairs, pairs_with_aliases, occurrence_eligible)
 
 
 if __name__ == "__main__":

@@ -72,19 +72,62 @@ def _build_bear_match_fn(
     return match
 
 
+def _build_subject_match_fn(
+    subj_terms_list: list[list[str]],
+) -> Callable[[str], bool]:
+    """Return a function that returns True when any subject surface form is
+    present in the sentence, regardless of whether the object is present.
+
+    subj_terms_list: list of subject surface-form lists (canonical label +
+    Wikidata aliases). Unlike _build_bear_match_fn, this is a flat "any
+    subject term present" check — no cross-referencing against an object is
+    needed.
+    """
+    all_cs: list[str] = []
+    all_ci: list[str] = []
+    for terms in subj_terms_list:
+        cs, ci = _split_case(terms)
+        all_cs.extend(cs)
+        all_ci.extend(ci)
+
+    re_ci = _compile_alt(all_ci, re.IGNORECASE)
+    re_cs = _compile_alt(all_cs, 0)
+
+    def match(text: str) -> bool:
+        if not text:
+            return False
+        if re_ci is not None and re_ci.search(text.lower()):
+            return True
+        if re_cs is not None and re_cs.search(text):
+            return True
+        return False
+
+    return match
+
+
 class BearFactsFilter(CorpusFilter):
-    """Marks sentences where a confidently-learned BEAR subject and object co-occur.
+    """Marks sentences where a confidently-learned BEAR subject and object co-occur,
+    and optionally also sentences that merely mention an occurrence-eligible subject.
 
     Accepts pairs_with_aliases: a list of (subject_terms, object_terms) where
     each element is a list of surface forms (canonical label + Wikidata aliases).
+
+    occurrence_subj_terms (optional): subject surface-form lists for the subset
+    of facts eligible for subject-only removal (e.g. low corpus subject-count).
+    When given, a sentence is also excluded if it merely mentions one of these
+    subjects, even without the paired object.
     """
 
     def __init__(
         self,
         pairs_with_aliases: list[tuple[list[str], list[str]]],
+        occurrence_subj_terms: list[list[str]] | None = None,
         name: str = "BearFacts",
     ) -> None:
         self._match = _build_bear_match_fn(pairs_with_aliases)
+        self._occurrence_match = (
+            _build_subject_match_fn(occurrence_subj_terms) if occurrence_subj_terms else None
+        )
         self._name = name
 
     @property
@@ -93,7 +136,9 @@ class BearFactsFilter(CorpusFilter):
 
     def _exclude_sent(self, sent) -> bool:
         text = sent.metadata.get("text", "")
-        return self._match(text)
+        if self._match(text):
+            return True
+        return self._occurrence_match(text) if self._occurrence_match else False
 
 # Mirrors data/capitals_pairs.csv — update both if pairs change.
 _PAIRS = [
