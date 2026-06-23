@@ -299,14 +299,17 @@ def _write_per_fact_files(
     pairs: list[tuple[str, str, str]],
     pairs_with_aliases: list[tuple[list[str], list[str]]],
     occurrence_eligible: set[tuple[str, str, str]],
+    occurrence_obj_eligible: set[tuple[str, str, str]],
 ) -> None:
     """Write per-fact matched files under output_dir/BearFacts/facts/<slug>/.
 
     Each matched line is checked against the fact's cooccurrence match first;
     if it matches, it's filed under <slug>/cooccurrence/train_matched.txt.
-    Otherwise, if the fact is occurrence-eligible and the line merely mentions
-    the subject, it's filed under <slug>/subj_occurrence/train_matched.txt.
-    The two files are disjoint per fact by construction.
+    Otherwise, if the fact is subject-occurrence-eligible and the line merely
+    mentions the subject, it's filed under <slug>/subj_occurrence/train_matched.txt.
+    Otherwise, if the fact is object-occurrence-eligible and the line merely
+    mentions the object, it's filed under <slug>/obj_occurrence/train_matched.txt.
+    The three files are disjoint per fact by construction.
     """
     matched_txt = output_dir / "BearFacts" / "train_matched.txt"
     if not matched_txt.exists():
@@ -318,7 +321,7 @@ def _write_per_fact_files(
         print("  Per-fact split: train_matched.txt is empty, skipping.")
         return
 
-    # Build per-fact match functions (cooccurrence always; subject-only when eligible)
+    # Build per-fact match functions (cooccurrence always; subject/object-only when eligible)
     entries = []
     for (subj, obj, rel_id), (subj_terms, obj_terms) in zip(pairs, pairs_with_aliases):
         slug = _fact_slug(rel_id, subj, obj)
@@ -328,16 +331,24 @@ def _write_per_fact_files(
             if (subj, obj, rel_id) in occurrence_eligible
             else None
         )
-        entries.append((slug, cooccur_fn, subj_fn))
+        obj_fn = (
+            _build_subject_match_fn([obj_terms])
+            if (subj, obj, rel_id) in occurrence_obj_eligible
+            else None
+        )
+        entries.append((slug, cooccur_fn, subj_fn, obj_fn))
 
     cooccur_lines: dict[str, list[str]] = {}
     subj_occur_lines: dict[str, list[str]] = {}
+    obj_occur_lines: dict[str, list[str]] = {}
     for line in lines:
-        for slug, cooccur_fn, subj_fn in entries:
+        for slug, cooccur_fn, subj_fn, obj_fn in entries:
             if cooccur_fn(line):
                 cooccur_lines.setdefault(slug, []).append(line)
             elif subj_fn is not None and subj_fn(line):
                 subj_occur_lines.setdefault(slug, []).append(line)
+            elif obj_fn is not None and obj_fn(line):
+                obj_occur_lines.setdefault(slug, []).append(line)
 
     def _write(bucket: dict[str, list[str]], subdir: str) -> int:
         n = 0
@@ -350,8 +361,10 @@ def _write_per_fact_files(
 
     n_cooccur = _write(cooccur_lines, "cooccurrence")
     n_subj_occur = _write(subj_occur_lines, "subj_occurrence")
+    n_obj_occur = _write(obj_occur_lines, "obj_occurrence")
     print(f"  Per-fact files: {n_cooccur}/{len(entries)} facts have cooccurrence matches, "
-          f"{n_subj_occur}/{len(entries)} facts have subj_occurrence matches")
+          f"{n_subj_occur}/{len(entries)} facts have subj_occurrence matches, "
+          f"{n_obj_occur}/{len(entries)} facts have obj_occurrence matches")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -425,6 +438,14 @@ def main() -> None:
              "cooccurring lines) for qualifying facts whose corpus subject-count is below "
              "this threshold. Requires --corpus-stats. Written to a separate "
              "<slug>/subj_occurrence/ subfolder per fact, disjoint from <slug>/cooccurrence/.",
+    )
+    parser.add_argument(
+        "--occurrence-object-count-threshold", type=int, default=None, metavar="N",
+        help="If set, also remove every sentence merely mentioning the object (not just "
+             "cooccurring lines) for qualifying facts whose corpus object-count is below "
+             "this threshold. Requires --corpus-stats. Written to a separate "
+             "<slug>/obj_occurrence/ subfolder per fact, disjoint from <slug>/cooccurrence/ "
+             "and <slug>/subj_occurrence/.",
     )
     args = parser.parse_args()
 
@@ -514,13 +535,33 @@ def main() -> None:
         print(f"  Occurrence-eligible facts (subject_count < {threshold}): "
               f"{len(occurrence_eligible)} / {len(pairs)}")
 
-    bear_filter = BearFactsFilter(pairs_with_aliases, occurrence_subj_terms or None)
+    occurrence_obj_eligible: set[tuple[str, str, str]] = set()
+    occurrence_obj_terms: list[list[str]] = []
+    if args.occurrence_object_count_threshold is not None:
+        threshold = args.occurrence_object_count_threshold
+        for (subj, obj, rel_id), (_subj_terms, obj_terms) in zip(pairs, pairs_with_aliases):
+            stats = corpus_lookup.get((subj, obj), {})
+            if stats.get("object", 0) < threshold:
+                occurrence_obj_eligible.add((subj, obj, rel_id))
+                occurrence_obj_terms.append(obj_terms)
+        print(f"  Occurrence-eligible facts (object_count < {threshold}): "
+              f"{len(occurrence_obj_eligible)} / {len(pairs)}")
+
+    bear_filter = BearFactsFilter(
+        pairs_with_aliases,
+        occurrence_subj_terms or None,
+        occurrence_obj_terms or None,
+    )
     print(f"\nRunning BearFacts filter over {args.input}")
     run_filters([bear_filter], args.input, output_dir=args.output)
 
-    # Write per-fact matched files under BearFacts/facts/<slug>/{cooccurrence,subj_occurrence}/
+    # Write per-fact matched files under
+    # BearFacts/facts/<slug>/{cooccurrence,subj_occurrence,obj_occurrence}/
     print(f"\nWriting per-fact matched files ...")
-    _write_per_fact_files(Path(args.output), pairs, pairs_with_aliases, occurrence_eligible)
+    _write_per_fact_files(
+        Path(args.output), pairs, pairs_with_aliases,
+        occurrence_eligible, occurrence_obj_eligible,
+    )
 
 
 if __name__ == "__main__":

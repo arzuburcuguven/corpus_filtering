@@ -107,26 +107,32 @@ def _build_subject_match_fn(
 
 class BearFactsFilter(CorpusFilter):
     """Marks sentences where a confidently-learned BEAR subject and object co-occur,
-    and optionally also sentences that merely mention an occurrence-eligible subject.
+    and optionally also sentences that merely mention an occurrence-eligible subject
+    or object.
 
     Accepts pairs_with_aliases: a list of (subject_terms, object_terms) where
     each element is a list of surface forms (canonical label + Wikidata aliases).
 
-    occurrence_subj_terms (optional): subject surface-form lists for the subset
-    of facts eligible for subject-only removal (e.g. low corpus subject-count).
-    When given, a sentence is also excluded if it merely mentions one of these
-    subjects, even without the paired object.
+    occurrence_subj_terms / occurrence_obj_terms (optional): surface-form lists
+    for the subset of facts eligible for subject-only / object-only removal
+    (e.g. low corpus subject-count or object-count). When given, a sentence is
+    also excluded if it merely mentions one of these subjects or objects, even
+    without the paired counterpart.
     """
 
     def __init__(
         self,
         pairs_with_aliases: list[tuple[list[str], list[str]]],
         occurrence_subj_terms: list[list[str]] | None = None,
+        occurrence_obj_terms: list[list[str]] | None = None,
         name: str = "BearFacts",
     ) -> None:
         self._match = _build_bear_match_fn(pairs_with_aliases)
         self._occurrence_match = (
             _build_subject_match_fn(occurrence_subj_terms) if occurrence_subj_terms else None
+        )
+        self._occurrence_obj_match = (
+            _build_subject_match_fn(occurrence_obj_terms) if occurrence_obj_terms else None
         )
         self._name = name
 
@@ -138,7 +144,9 @@ class BearFactsFilter(CorpusFilter):
         text = sent.metadata.get("text", "")
         if self._match(text):
             return True
-        return self._occurrence_match(text) if self._occurrence_match else False
+        if self._occurrence_match and self._occurrence_match(text):
+            return True
+        return bool(self._occurrence_obj_match and self._occurrence_obj_match(text))
 
 # Mirrors data/capitals_pairs.csv — update both if pairs change.
 _PAIRS = [
